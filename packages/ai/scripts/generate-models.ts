@@ -907,6 +907,36 @@ async function generateModels() {
 	];
 	allModels.push(...vertexModels);
 
+	// MiniMax models (Anthropic-compatible API)
+	const MINIMAX_BASE_URL = "https://api.minimax.io/anthropic/v1";
+	const minimaxModels: Model<"anthropic-messages">[] = [
+		{
+			id: "MiniMax-M2",
+			name: "MiniMax M2",
+			api: "anthropic-messages",
+			provider: "minimax",
+			baseUrl: MINIMAX_BASE_URL,
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 196608,
+			maxTokens: 128000,
+		},
+		{
+			id: "MiniMax-M2.1",
+			name: "MiniMax M2.1",
+			api: "anthropic-messages",
+			provider: "minimax",
+			baseUrl: MINIMAX_BASE_URL,
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0.29, output: 1.15, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 204800,
+			maxTokens: 131072,
+		},
+	];
+	allModels.push(...minimaxModels);
+
 	// Group by provider and deduplicate by model ID
 	const providers: Record<string, Record<string, Model<any>>> = {};
 	for (const model of allModels) {
