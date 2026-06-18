@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the OpenRouter Fusion router alias to built-in model metadata.
+
 ## [0.79.6] - 2026-06-16
 
 ### Fixed
