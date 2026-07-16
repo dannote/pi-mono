@@ -56,4 +56,36 @@ describe("InteractiveMode compaction events", () => {
 		);
 		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
 	});
+
+	test("queues compaction submissions when the agent run is still active", async () => {
+		const fakeThis = {
+			compactionQueuedMessages: [
+				{ text: "change direction", mode: "steer" as const },
+				{ text: "then continue", mode: "followUp" as const },
+			],
+			session: {
+				isStreaming: true,
+				clearQueue: vi.fn(),
+				prompt: vi.fn().mockRejectedValue(new Error("must not start a concurrent prompt")),
+				steer: vi.fn().mockResolvedValue(undefined),
+				followUp: vi.fn().mockResolvedValue(undefined),
+			},
+			isExtensionCommand: vi.fn().mockReturnValue(false),
+			updatePendingMessagesDisplay: vi.fn(),
+			showError: vi.fn(),
+		};
+
+		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+			options?: { willRetry?: boolean },
+		) => Promise<void>;
+
+		await flushCompactionQueue.call(fakeThis, { willRetry: false });
+
+		expect(fakeThis.session.prompt).not.toHaveBeenCalled();
+		expect(fakeThis.session.steer).toHaveBeenCalledWith("change direction");
+		expect(fakeThis.session.followUp).toHaveBeenCalledWith("then continue");
+		expect(fakeThis.compactionQueuedMessages).toEqual([]);
+		expect(fakeThis.showError).not.toHaveBeenCalled();
+	});
 });

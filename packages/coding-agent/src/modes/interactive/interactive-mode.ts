@@ -4010,8 +4010,8 @@ export class InteractiveMode {
 		};
 
 		try {
-			if (options?.willRetry) {
-				// When retry is pending, queue messages for the retry turn
+			if (options?.willRetry || this.session.isStreaming) {
+				// When the current run is still active, queue messages for its next turn.
 				for (const message of queuedMessages) {
 					if (this.isExtensionCommand(message.text)) {
 						await this.session.prompt(message.text);
