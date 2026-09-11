@@ -75,6 +75,7 @@ function getCompat(model: Model<"openai-responses">): ResolvedOpenAIResponsesCom
 		codexAttribution: model.compat?.codexAttribution,
 		supportsDeveloperRole: model.compat?.supportsDeveloperRole ?? true,
 		sessionAffinityFormat: model.compat?.sessionAffinityFormat ?? detectSessionAffinityFormat(model),
+		promptCacheKeyMode: model.compat?.promptCacheKeyMode ?? "auto",
 		supportsLongCacheRetention: model.compat?.supportsLongCacheRetention ?? true,
 		supportsStrictMode: model.compat?.supportsStrictMode ?? false,
 		supportsOpenAIGrammarTools: model.compat?.supportsOpenAIGrammarTools ?? false,
@@ -318,6 +319,7 @@ function buildParams(
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	const codexMetadata =
 		compat.codexAttribution === "official" ? buildCodexRequestMetadata(options?.requestIdentity) : undefined;
+	const sendPromptCacheKey = cacheRetention !== "none" && compat.promptCacheKeyMode !== "disabled";
 	const params: ResponseCreateParamsStreaming & {
 		prompt_cache_options?: { mode?: "explicit"; ttl?: "30m" };
 		client_metadata?: Record<string, string>;
@@ -325,7 +327,7 @@ function buildParams(
 		model: model.id,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : clampOpenAIPromptCacheKey(options?.sessionId),
+		prompt_cache_key: sendPromptCacheKey ? clampOpenAIPromptCacheKey(options?.sessionId) : undefined,
 		prompt_cache_retention: getPromptCacheRetention(compat, cacheRetention),
 		prompt_cache_options: getPromptCacheOptions(compat, cacheRetention),
 		store: false,
