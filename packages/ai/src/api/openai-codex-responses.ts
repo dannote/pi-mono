@@ -1404,8 +1404,10 @@ async function* parseWebSocket(
 	}
 }
 
-function requestBodyWithoutInput(body: RequestBody): RequestBody {
-	const { input: _input, previous_response_id: _previousResponseId, ...rest } = body;
+function requestBodyForComparison(body: RequestBody): RequestBody {
+	// Attribution describes this request, not the context referenced by previous_response_id.
+	// Compare without it, but keep the current metadata on every response.create frame.
+	const { input: _input, previous_response_id: _previousResponseId, client_metadata: _clientMetadata, ...rest } = body;
 	return rest;
 }
 
@@ -1413,15 +1415,14 @@ function responseInputsEqual(a: ResponseInput | undefined, b: ResponseInput | un
 	return JSON.stringify(a ?? []) === JSON.stringify(b ?? []);
 }
 
-function requestBodiesMatchExceptInput(a: RequestBody, b: RequestBody): boolean {
-	return JSON.stringify(requestBodyWithoutInput(a)) === JSON.stringify(requestBodyWithoutInput(b));
-}
-
 function getCachedWebSocketInputDelta(
 	body: RequestBody,
 	continuation: CachedWebSocketContinuationState,
 ): ResponseInput | undefined {
-	if (!requestBodiesMatchExceptInput(body, continuation.lastRequestBody)) {
+	if (
+		JSON.stringify(requestBodyForComparison(body)) !==
+		JSON.stringify(requestBodyForComparison(continuation.lastRequestBody))
+	) {
 		return undefined;
 	}
 
