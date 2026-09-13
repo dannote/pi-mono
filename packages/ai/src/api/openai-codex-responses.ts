@@ -328,7 +328,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 
 			const accountId = extractAccountId(apiKey);
 			const socketSessionId = options?.sessionId ?? options?.requestIdentity?.sessionId;
-			const socketOwner = socketSessionId ? websocketSessionOwners.get(socketSessionId) : undefined;
+			const socketOwner = socketSessionId ? websocketSessionCache.get(socketSessionId) : undefined;
 			if (
 				socketSessionId &&
 				socketOwner &&
@@ -985,9 +985,14 @@ export interface OpenAICodexWebSocketDebugStats {
 	lastWebSocketError?: string;
 }
 
-const websocketSessionCache = new Map<string, Map<string, CachedWebSocketConnection>>();
+interface WebSocketSession {
+	accountId: string;
+	url: string;
+	connection?: CachedWebSocketConnection;
+}
+
 // Record ownership before awaiting the handshake so late connections cannot restore old state.
-const websocketSessionOwners = new Map<string, { accountId: string; url: string }>();
+const websocketSessionCache = new Map<string, WebSocketSession>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
 const websocketSseFallbackSessions = new Set<string>();
 
@@ -1032,16 +1037,15 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		closeWebSocketSilently(entry.socket, 1000, "debug_close");
 	};
 	if (sessionId) {
-		websocketSessionOwners.delete(sessionId);
-		for (const entry of websocketSessionCache.get(sessionId)?.values() ?? []) closeEntry(entry);
+		const entry = websocketSessionCache.get(sessionId)?.connection;
+		if (entry) closeEntry(entry);
 		websocketSessionCache.delete(sessionId);
 		return;
 	}
-	for (const accountEntries of websocketSessionCache.values()) {
-		for (const entry of accountEntries.values()) closeEntry(entry);
+	for (const session of websocketSessionCache.values()) {
+		if (session.connection) closeEntry(session.connection);
 	}
 	websocketSessionCache.clear();
-	websocketSessionOwners.clear();
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
@@ -1141,16 +1145,14 @@ function closeWebSocketSilently(socket: WebSocketLike, code = 1000, reason = "do
 	} catch {}
 }
 
-function scheduleSessionWebSocketExpiry(sessionId: string, accountId: string, entry: CachedWebSocketConnection): void {
+function scheduleSessionWebSocketExpiry(session: WebSocketSession, entry: CachedWebSocketConnection): void {
 	if (entry.idleTimer) {
 		clearTimeout(entry.idleTimer);
 	}
 	entry.idleTimer = setTimeout(() => {
 		if (entry.busy) return;
 		closeWebSocketSilently(entry.socket, 1000, "idle_timeout");
-		const accountEntries = websocketSessionCache.get(sessionId);
-		if (accountEntries?.get(accountId) === entry) accountEntries.delete(accountId);
-		if (accountEntries?.size === 0) websocketSessionCache.delete(sessionId);
+		if (session.connection === entry) session.connection = undefined;
 	}, SESSION_WEBSOCKET_CACHE_TTL_MS);
 }
 
@@ -1255,14 +1257,14 @@ async function acquireWebSocket(
 		};
 	}
 
-	let owner = websocketSessionOwners.get(sessionId);
-	if (!owner || owner.accountId !== accountId || owner.url !== url) {
+	let session = websocketSessionCache.get(sessionId);
+	if (!session || session.accountId !== accountId || session.url !== url) {
 		closeOpenAICodexWebSocketSessions(sessionId);
-		owner = { accountId, url };
-		websocketSessionOwners.set(sessionId, owner);
+		session = { accountId, url };
+		websocketSessionCache.set(sessionId, session);
 	}
-	let accountEntries = websocketSessionCache.get(sessionId);
-	const cached = accountEntries?.get(accountId);
+	const cached = session.connection;
+	let entry: CachedWebSocketConnection | undefined;
 	if (cached) {
 		if (cached.idleTimer) {
 			clearTimeout(cached.idleTimer);
@@ -1270,75 +1272,54 @@ async function acquireWebSocket(
 		}
 		if (!cached.busy && isWebSocketSessionExpired(cached)) {
 			closeWebSocketSilently(cached.socket, 1000, "connection_age_limit");
-			accountEntries?.delete(accountId);
-			if (accountEntries?.size === 0) websocketSessionCache.delete(sessionId);
+			session.connection = undefined;
 		} else if (!cached.busy && isWebSocketReusable(cached.socket)) {
-			cached.busy = true;
-			return {
-				socket: cached.socket,
-				entry: cached,
-				reused: true,
-				release: ({ keep } = {}) => {
-					if (!keep || !isWebSocketReusable(cached.socket)) {
-						closeWebSocketSilently(cached.socket);
-						const currentEntries = websocketSessionCache.get(sessionId);
-						if (currentEntries?.get(accountId) === cached) currentEntries.delete(accountId);
-						if (currentEntries?.size === 0) websocketSessionCache.delete(sessionId);
-						return;
-					}
-					cached.busy = false;
-					scheduleSessionWebSocketExpiry(sessionId, accountId, cached);
-				},
-			};
-		}
-		if (cached.busy) {
-			const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs, env);
-			if (websocketSessionOwners.get(sessionId) !== owner) {
-				closeWebSocketSilently(socket);
-				throw new CodexSessionChangedError("WebSocket session changed during connection");
-			}
-			return {
-				socket,
-				reused: false,
-				release: () => {
-					closeWebSocketSilently(socket);
-				},
-			};
-		}
-		if (!isWebSocketReusable(cached.socket)) {
+			entry = cached;
+		} else if (!cached.busy && !isWebSocketReusable(cached.socket)) {
 			closeWebSocketSilently(cached.socket);
-			accountEntries?.delete(accountId);
-			if (accountEntries?.size === 0) websocketSessionCache.delete(sessionId);
+			session.connection = undefined;
 		}
 	}
 
-	const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs, env);
-	if (websocketSessionOwners.get(sessionId) !== owner) {
-		closeWebSocketSilently(socket);
-		throw new CodexSessionChangedError("WebSocket session changed during connection");
+	const reused = entry !== undefined;
+	if (!entry) {
+		let socket: WebSocketLike;
+		try {
+			socket = await connectWebSocket(url, headers, signal, connectTimeoutMs, env);
+		} catch (error) {
+			// A stale failure must not disable WebSockets or trigger SSE for the new owner.
+			if (websocketSessionCache.get(sessionId) !== session) {
+				throw new CodexSessionChangedError("WebSocket session changed during connection");
+			}
+			throw error;
+		}
+		if (websocketSessionCache.get(sessionId) !== session) {
+			closeWebSocketSilently(socket);
+			throw new CodexSessionChangedError("WebSocket session changed during connection");
+		}
+		// Another request may already own the cached connection, including one
+		// whose handshake completed while this request was connecting.
+		if (session.connection) {
+			return { socket, reused: false, release: () => closeWebSocketSilently(socket) };
+		}
+		entry = { socket, busy: true, createdAt: Date.now() };
+		session.connection = entry;
 	}
-	const entry: CachedWebSocketConnection = { socket, busy: true, createdAt: Date.now() };
-	accountEntries = websocketSessionCache.get(sessionId);
-	if (!accountEntries) {
-		accountEntries = new Map();
-		websocketSessionCache.set(sessionId, accountEntries);
-	}
-	accountEntries.set(accountId, entry);
+	const connection = entry;
+	connection.busy = true;
 	return {
-		socket,
-		entry,
-		reused: false,
+		socket: connection.socket,
+		entry: connection,
+		reused,
 		release: ({ keep } = {}) => {
-			if (!keep || !isWebSocketReusable(entry.socket)) {
-				closeWebSocketSilently(entry.socket);
-				if (entry.idleTimer) clearTimeout(entry.idleTimer);
-				const currentEntries = websocketSessionCache.get(sessionId);
-				if (currentEntries?.get(accountId) === entry) currentEntries.delete(accountId);
-				if (currentEntries?.size === 0) websocketSessionCache.delete(sessionId);
+			if (!keep || websocketSessionCache.get(sessionId) !== session || !isWebSocketReusable(connection.socket)) {
+				closeWebSocketSilently(connection.socket);
+				if (connection.idleTimer) clearTimeout(connection.idleTimer);
+				if (session.connection === connection) session.connection = undefined;
 				return;
 			}
-			entry.busy = false;
-			scheduleSessionWebSocketExpiry(sessionId, accountId, entry);
+			connection.busy = false;
+			scheduleSessionWebSocketExpiry(session, connection);
 		},
 	};
 }

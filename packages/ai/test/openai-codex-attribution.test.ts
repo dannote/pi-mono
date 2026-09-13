@@ -88,10 +88,11 @@ function completedEvents(responseId = "response-1"): Array<Record<string, unknow
 
 function captureWebSocketRequests(
 	eventsForRequest = (index: number) => completedEvents(`response-${index}`),
-	openConnection: (open: () => void) => void = queueMicrotask,
+	openConnection: (open: () => void, fail: () => void) => void = queueMicrotask,
 ) {
 	const handshakes: Array<Record<string, string> | undefined> = [];
 	const urls: string[] = [];
+	const sockets: MockWebSocket[] = [];
 	const frames: Array<{
 		input: Array<Record<string, unknown>>;
 		previous_response_id?: string;
@@ -101,9 +102,13 @@ function captureWebSocketRequests(
 		readyState = 1;
 		private listeners = new Map<string, Set<(event: unknown) => void>>();
 		constructor(_url: string, options?: { headers?: Record<string, string> }) {
+			sockets.push(this);
 			urls.push(_url);
 			handshakes.push(options?.headers);
-			openConnection(() => this.dispatch("open", {}));
+			openConnection(
+				() => this.dispatch("open", {}),
+				() => this.dispatch("error", { message: "Handshake failed" }),
+			);
 		}
 		addEventListener(type: string, listener: (event: unknown) => void): void {
 			const listeners = this.listeners.get(type) ?? new Set();
@@ -138,7 +143,7 @@ function captureWebSocketRequests(
 			throw new Error("Unexpected HTTP fallback");
 		}),
 	);
-	return { handshakes, frames, urls };
+	return { handshakes, frames, urls, sockets };
 }
 
 function parseTurnMetadata(clientMetadata: Record<string, string>): Record<string, unknown> {
@@ -553,9 +558,20 @@ describe("OpenAI Codex turn routing", () => {
 		expect(headers.at(-1)?.get("x-codex-turn-state")).toBe("first");
 	});
 
-	it.each(["account", "cleanup"])("does not restore a pending handshake after %s changes", async (change) => {
+	it.each([
+		["account", "open"],
+		["account", "fail"],
+		["endpoint", "open"],
+		["endpoint", "fail"],
+		["cleanup", "open"],
+		["cleanup", "fail"],
+	])("isolates a stale handshake after %s changes when it settles with %s", async (change, outcome) => {
 		const opens: Array<() => void> = [];
-		const { frames, handshakes } = captureWebSocketRequests(undefined, (open) => opens.push(open));
+		const failures: Array<() => void> = [];
+		const { frames, handshakes } = captureWebSocketRequests(undefined, (open, fail) => {
+			opens.push(open);
+			failures.push(fail);
+		});
 		const wsOptions = {
 			...options,
 			transport: "auto" as const,
@@ -566,16 +582,43 @@ describe("OpenAI Codex turn routing", () => {
 		await vi.waitFor(() => expect(opens).toHaveLength(1));
 		if (change === "cleanup") cleanupSessionResources(identity.sessionId);
 		const currentOptions = { ...wsOptions, apiKey: change === "account" ? token("account-2") : token() };
-		const current = streamOpenAICodexResponses(model, context, currentOptions).result();
+		const currentModel = change === "endpoint" ? { ...model, baseUrl: "https://other.test" } : model;
+		const current = streamOpenAICodexResponses(currentModel, context, currentOptions).result();
 		await vi.waitFor(() => expect(opens).toHaveLength(2));
 		opens[1]();
 		expect((await current).stopReason).toBe("stop");
-		opens[0]();
+		if (outcome === "open") opens[0]();
+		else failures[0]();
 		expect((await pending).stopReason).toBe("error");
 		expect(globalThis.fetch).not.toHaveBeenCalled();
-		expect((await streamOpenAICodexResponses(model, context, currentOptions).result()).stopReason).toBe("stop");
+		expect((await streamOpenAICodexResponses(currentModel, context, currentOptions).result()).stopReason).toBe(
+			"stop",
+		);
 		expect(frames).toHaveLength(2);
 		expect(handshakes).toHaveLength(2);
+	});
+
+	it("keeps only one cached connection when concurrent handshakes complete", async () => {
+		const opens: Array<() => void> = [];
+		const { sockets, handshakes } = captureWebSocketRequests(undefined, (open) => opens.push(open));
+		const wsOptions = {
+			...options,
+			transport: "auto" as const,
+			cacheRetention: "short" as const,
+			sessionId: identity.sessionId,
+		};
+		const first = streamOpenAICodexResponses(model, context, wsOptions).result();
+		const second = streamOpenAICodexResponses(model, context, wsOptions).result();
+		await vi.waitFor(() => expect(opens).toHaveLength(2));
+		opens[0]();
+		expect((await first).stopReason).toBe("stop");
+		opens[1]();
+		expect((await second).stopReason).toBe("stop");
+		expect(sockets.map((socket) => socket.readyState)).toEqual([1, 3]);
+		expect((await streamOpenAICodexResponses(model, context, wsOptions).result()).stopReason).toBe("stop");
+		expect(handshakes).toHaveLength(2);
+		cleanupSessionResources(identity.sessionId);
+		expect(sockets.map((socket) => socket.readyState)).toEqual([3, 3]);
 	});
 
 	it("invalidates a cached socket when an intervening SSE request changes account", async () => {
