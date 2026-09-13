@@ -57,6 +57,70 @@ const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
+const TURN_STATE_HEADER = "x-codex-turn-state";
+
+interface CodexTurnState {
+	sessionId: string;
+	accountId: string;
+	url: string;
+	turnId: string;
+	value?: string;
+}
+
+// Keep only the current foreground and compaction turns per session/thread.
+// Compaction must not displace a foreground turn that will resume afterward.
+// Low-level callers must release session resources when done, just like socket users.
+const codexTurnStates = new Map<string, CodexTurnState>();
+
+function getCodexTurnState(
+	identity: AgentRequestIdentity | undefined,
+	accountId: string,
+	url: string,
+): CodexTurnState | undefined {
+	if (!identity) return undefined;
+	for (const [key, state] of codexTurnStates) {
+		if (state.sessionId === identity.sessionId && (state.accountId !== accountId || state.url !== url)) {
+			codexTurnStates.delete(key);
+		}
+	}
+	const key = JSON.stringify([identity.sessionId, identity.threadId, identity.requestKind]);
+	const previous = codexTurnStates.get(key);
+	const state =
+		previous?.turnId === identity.turnId
+			? previous
+			: { sessionId: identity.sessionId, accountId, url, turnId: identity.turnId };
+	codexTurnStates.set(key, state);
+	return state;
+}
+
+function captureCodexTurnState(state: CodexTurnState | undefined, value: unknown): void {
+	// The server's first value is opaque and must be replayed unchanged, never logged.
+	if (state && state.value === undefined && typeof value === "string" && /^[\x21-\x7e]+$/.test(value)) {
+		state.value = value;
+	}
+}
+
+function applyCodexTurnState(
+	headers: Headers,
+	state: CodexTurnState | undefined,
+	modelHeaders: Record<string, string> | undefined,
+	callerHeaders: ProviderHeaders | undefined,
+): void {
+	let value: string | null | undefined = state?.value;
+	for (const source of [modelHeaders, callerHeaders]) {
+		for (const [key, override] of Object.entries(source ?? {})) {
+			if (key.toLowerCase() === TURN_STATE_HEADER) value = override;
+		}
+	}
+	if (value != null) headers.set(TURN_STATE_HEADER, value);
+	else headers.delete(TURN_STATE_HEADER);
+}
+
+registerSessionResourceCleanup((sessionId) => {
+	for (const [key, state] of codexTurnStates) {
+		if (sessionId === undefined || state.sessionId === sessionId) codexTurnStates.delete(key);
+	}
+});
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -263,6 +327,17 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			}
 
 			const accountId = extractAccountId(apiKey);
+			const socketSessionId = options?.sessionId ?? options?.requestIdentity?.sessionId;
+			const socketOwner = socketSessionId ? websocketSessionOwners.get(socketSessionId) : undefined;
+			if (
+				socketSessionId &&
+				socketOwner &&
+				(socketOwner.accountId !== accountId || socketOwner.url !== resolveCodexWebSocketUrl(model.baseUrl))
+			) {
+				// A temporary SSE request can also change ownership of an existing socket.
+				closeOpenAICodexWebSocketSessions(socketSessionId);
+			}
+			const turnState = getCodexTurnState(options?.requestIdentity, accountId, resolveCodexUrl(model.baseUrl));
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				context.tools,
 				model.compat?.supportsOpenAIGrammarTools ?? false,
@@ -329,6 +404,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							cacheSessionId,
 							accountId,
 							grammarToolInputProperties,
+							turnState,
 							options,
 						);
 
@@ -398,6 +474,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				}
 
 				try {
+					applyCodexTurnState(sseHeaders, turnState, model.headers, options?.headers);
 					const headerTimeoutSignal =
 						httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
 					const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
@@ -416,6 +493,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					} finally {
 						combinedSignal.cleanup();
 					}
+					captureCodexTurnState(turnState, response.headers.get(TURN_STATE_HEADER));
 					await options?.onResponse?.(
 						{ status: response.status, headers: headersToRecord(response.headers) },
 						model,
@@ -477,7 +555,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				startEmitted = true;
 				stream.push({ type: "start", partial: output });
 			}
-			await processStream(response, output, stream, model, grammarToolInputProperties, options);
+			await processStream(response, output, stream, model, grammarToolInputProperties, turnState, options);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -671,14 +749,21 @@ async function processStream(
 	stream: AssistantMessageEventStream,
 	model: Model<"openai-codex-responses">,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
+	turnState: CodexTurnState | undefined,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
-	await processResponsesStream(mapCodexEvents(parseSSE(response, options?.signal), output), output, stream, model, {
-		serviceTier: options?.serviceTier,
-		grammarToolInputProperties,
-		resolveServiceTier: resolveCodexServiceTier,
-		applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
-	});
+	await processResponsesStream(
+		mapCodexEvents(parseSSE(response, options?.signal), output, turnState),
+		output,
+		stream,
+		model,
+		{
+			serviceTier: options?.serviceTier,
+			grammarToolInputProperties,
+			resolveServiceTier: resolveCodexServiceTier,
+			applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+		},
+	);
 }
 
 class CodexApiError extends Error {
@@ -705,8 +790,12 @@ class CodexProtocolError extends Error {
 	}
 }
 
+class CodexSessionChangedError extends Error {}
+
 function isCodexNonTransportError(error: unknown): boolean {
-	return error instanceof CodexApiError || error instanceof CodexProtocolError;
+	return (
+		error instanceof CodexApiError || error instanceof CodexProtocolError || error instanceof CodexSessionChangedError
+	);
 }
 
 function isWebSocketConnectionLimitReachedError(error: unknown): boolean {
@@ -733,10 +822,17 @@ function extractCodexEventError(event: Record<string, unknown>): { code?: string
 async function* mapCodexEvents(
 	events: AsyncIterable<Record<string, unknown>>,
 	output: AssistantMessage,
+	turnState: CodexTurnState | undefined,
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		const type = typeof event.type === "string" ? event.type : undefined;
 		if (!type) continue;
+		if (type === "codex.response.metadata" || type === "response.metadata") {
+			if (event.headers && typeof event.headers === "object") {
+				captureCodexTurnState(turnState, (event.headers as Record<string, unknown>)[TURN_STATE_HEADER]);
+			}
+			continue;
+		}
 
 		if (type === "error") {
 			const { code, message } = extractCodexEventError(event);
@@ -890,6 +986,8 @@ export interface OpenAICodexWebSocketDebugStats {
 }
 
 const websocketSessionCache = new Map<string, Map<string, CachedWebSocketConnection>>();
+// Record ownership before awaiting the handshake so late connections cannot restore old state.
+const websocketSessionOwners = new Map<string, { accountId: string; url: string }>();
 const websocketDebugStats = new Map<string, OpenAICodexWebSocketDebugStats>();
 const websocketSseFallbackSessions = new Set<string>();
 
@@ -934,6 +1032,7 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		closeWebSocketSilently(entry.socket, 1000, "debug_close");
 	};
 	if (sessionId) {
+		websocketSessionOwners.delete(sessionId);
 		for (const entry of websocketSessionCache.get(sessionId)?.values() ?? []) closeEntry(entry);
 		websocketSessionCache.delete(sessionId);
 		return;
@@ -942,6 +1041,7 @@ export function closeOpenAICodexWebSocketSessions(sessionId?: string): void {
 		for (const entry of accountEntries.values()) closeEntry(entry);
 	}
 	websocketSessionCache.clear();
+	websocketSessionOwners.clear();
 }
 
 registerSessionResourceCleanup(closeOpenAICodexWebSocketSessions);
@@ -1155,6 +1255,12 @@ async function acquireWebSocket(
 		};
 	}
 
+	let owner = websocketSessionOwners.get(sessionId);
+	if (!owner || owner.accountId !== accountId || owner.url !== url) {
+		closeOpenAICodexWebSocketSessions(sessionId);
+		owner = { accountId, url };
+		websocketSessionOwners.set(sessionId, owner);
+	}
 	let accountEntries = websocketSessionCache.get(sessionId);
 	const cached = accountEntries?.get(accountId);
 	if (cached) {
@@ -1187,6 +1293,10 @@ async function acquireWebSocket(
 		}
 		if (cached.busy) {
 			const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs, env);
+			if (websocketSessionOwners.get(sessionId) !== owner) {
+				closeWebSocketSilently(socket);
+				throw new CodexSessionChangedError("WebSocket session changed during connection");
+			}
 			return {
 				socket,
 				reused: false,
@@ -1203,6 +1313,10 @@ async function acquireWebSocket(
 	}
 
 	const socket = await connectWebSocket(url, headers, signal, connectTimeoutMs, env);
+	if (websocketSessionOwners.get(sessionId) !== owner) {
+		closeWebSocketSilently(socket);
+		throw new CodexSessionChangedError("WebSocket session changed during connection");
+	}
 	const entry: CachedWebSocketConnection = { socket, busy: true, createdAt: Date.now() };
 	accountEntries = websocketSessionCache.get(sessionId);
 	if (!accountEntries) {
@@ -1486,6 +1600,7 @@ async function processWebSocketStream(
 	cacheSessionId: string | undefined,
 	accountId: string,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
+	turnState: CodexTurnState | undefined,
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
 	const { socket, entry, reused, release } = await acquireWebSocket(
@@ -1522,10 +1637,23 @@ async function processWebSocketStream(
 		}
 	}
 	try {
-		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
+		// A socket can span turns. Keep automatic routing out of its handshake;
+		// otherwise the handshake's old state can leak into later request frames.
+		const requestHeaders = new Headers(headers);
+		applyCodexTurnState(requestHeaders, turnState, model.headers, options?.headers);
+		const routingState = requestHeaders.get(TURN_STATE_HEADER);
+		socket.send(
+			JSON.stringify({
+				type: "response.create",
+				...requestBody,
+				...(routingState
+					? { client_metadata: { ...requestBody.client_metadata, [TURN_STATE_HEADER]: routingState } }
+					: {}),
+			}),
+		);
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
-				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs), output),
+				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs), output, turnState),
 				onStart,
 			),
 			output,

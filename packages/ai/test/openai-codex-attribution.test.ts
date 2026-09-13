@@ -2,6 +2,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	closeOpenAICodexWebSocketSessions,
 	resetOpenAICodexWebSocketDebugStats,
 	stream as streamOpenAICodexResponses,
 	streamSimple as streamSimpleOpenAICodexResponses,
@@ -313,4 +314,333 @@ describe("OpenAI Codex attribution", () => {
 		expect(capturedHeaders?.get("originator")).toBe("custom");
 		expect(capturedHeaders?.get("thread-id")).toBe("custom-thread");
 	});
+});
+
+// #9481: routing state belongs to a logical turn, not a socket or prompt-cache key.
+describe("OpenAI Codex turn routing", () => {
+	const options = {
+		apiKey: token(),
+		transport: "sse" as const,
+		requestIdentity: identity,
+		cacheRetention: "none" as const,
+	};
+	function captureSSE(responseForRequest: (index: number) => Response = () => sseResponse()) {
+		const headers: Headers[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (_url: string | URL, init?: RequestInit) => {
+				headers.push(new Headers(init?.headers));
+				return responseForRequest(headers.length);
+			}),
+		);
+		return headers;
+	}
+	function sseResponse(state = "first", events = completedEvents()): Response {
+		return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+			headers: { "content-type": "text/event-stream", "x-codex-turn-state": state },
+		});
+	}
+	const metadata = (state: unknown, type = "codex.response.metadata") => ({
+		type,
+		headers: { "x-codex-turn-state": state },
+	});
+
+	it("keeps the first HTTP state through continuations and intervening compaction, but not new turns", async () => {
+		const headers = captureSSE((index) => sseResponse(`state-${index}`));
+		for (const requestIdentity of [
+			identity,
+			identity,
+			{ ...identity, turnId: "summary", requestKind: "compaction" as const },
+			{ ...identity, windowId: "thread-1:1" },
+			{ ...identity, turnId: "next" },
+		]) {
+			expect(
+				(await streamOpenAICodexResponses(model, context, { ...options, requestIdentity }).result()).stopReason,
+			).toBe("stop");
+		}
+		expect(headers.map((h) => h.get("x-codex-turn-state"))).toEqual([null, "state-1", null, "state-1", null]);
+	});
+
+	it("captures state on a retryable HTTP failure before the internal retry", async () => {
+		const headers = captureSSE((index) =>
+			index === 1
+				? new Response("overloaded", {
+						status: 503,
+						headers: { "retry-after-ms": "0", "x-codex-turn-state": "retry-state" },
+					})
+				: sseResponse(),
+		);
+		expect(
+			(await streamOpenAICodexResponses(model, context, { ...options, maxRetries: 1 }).result()).stopReason,
+		).toBe("stop");
+		expect(headers.map((h) => h.get("x-codex-turn-state"))).toEqual([null, "retry-state"]);
+	});
+
+	it.each(["codex.response.metadata", "response.metadata"])(
+		"captures %s and replays it on frames and reconnects",
+		async (type) => {
+			const { frames, handshakes } = captureWebSocketRequests((index) => [
+				metadata(`state-${index}`, type),
+				...completedEvents(`response-${index}`),
+			]);
+			const wsOptions = {
+				...options,
+				transport: "auto" as const,
+				cacheRetention: "short" as const,
+				sessionId: identity.sessionId,
+			};
+			const messages = [...context.messages];
+			for (let index = 0; index < 4; index++) {
+				if (index === 2) closeOpenAICodexWebSocketSessions(identity.sessionId);
+				const result = await streamOpenAICodexResponses(
+					model,
+					{ ...context, messages },
+					{ ...wsOptions, requestIdentity: index === 3 ? { ...identity, turnId: "next" } : identity },
+				).result();
+				expect(result.stopReason).toBe("stop");
+				messages.push(result, { role: "user", content: "next", timestamp: 2 });
+			}
+			expect(frames.map((f) => f.client_metadata?.["x-codex-turn-state"])).toEqual([
+				undefined,
+				"state-1",
+				"state-1",
+				undefined,
+			]);
+			expect(handshakes.map((h) => h?.["x-codex-turn-state"])).toEqual([undefined, undefined]);
+			expect(frames[1].previous_response_id).toBe("response-1");
+		},
+	);
+
+	it("preserves metadata received before a transport failure for immediate SSE fallback", async () => {
+		captureWebSocketRequests(() => [metadata("before-close"), { type: "test.close" }]);
+		const headers = captureSSE();
+		expect(
+			(
+				await streamOpenAICodexResponses(model, context, {
+					...options,
+					transport: "auto",
+					sessionId: identity.sessionId,
+				}).result()
+			).stopReason,
+		).toBe("stop");
+		expect(headers[0].get("x-codex-turn-state")).toBe("before-close");
+	});
+
+	it("preserves state after streamed output fails, without silently retrying partial output", async () => {
+		captureWebSocketRequests(() => [metadata("partial"), ...completedEvents().slice(0, 3), { type: "test.close" }]);
+		const headers = captureSSE();
+		const retryOptions = {
+			...options,
+			transport: "auto" as const,
+			cacheRetention: "short" as const,
+			sessionId: identity.sessionId,
+		};
+		expect((await streamOpenAICodexResponses(model, context, retryOptions).result()).stopReason).toBe("error");
+		expect(headers).toHaveLength(0);
+		expect((await streamOpenAICodexResponses(model, context, retryOptions).result()).stopReason).toBe("stop");
+		expect(headers[0].get("x-codex-turn-state")).toBe("partial");
+	});
+
+	it.each(["account", "endpoint", "cleanup", "thread", "session"])(
+		"isolates routing after %s changes",
+		async (change) => {
+			const headers = captureSSE();
+			await streamOpenAICodexResponses(model, context, options).result();
+			if (change === "cleanup") cleanupSessionResources(identity.sessionId);
+			await streamOpenAICodexResponses(
+				change === "endpoint" ? { ...model, baseUrl: "https://example.test" } : model,
+				context,
+				{
+					...options,
+					apiKey: change === "account" ? token("account-2") : token(),
+					requestIdentity: {
+						...identity,
+						...(change === "thread" ? { threadId: "other" } : change === "session" ? { sessionId: "other" } : {}),
+					},
+				},
+			).result();
+			expect(headers[1].get("x-codex-turn-state")).toBeNull();
+			if (change === "account" || change === "endpoint") {
+				await streamOpenAICodexResponses(model, context, options).result();
+				expect(headers[2].get("x-codex-turn-state")).toBeNull();
+			}
+		},
+	);
+
+	it.each(["custom", null])("honors a case-insensitive explicit routing override: %s", async (override) => {
+		const { frames, handshakes } = captureWebSocketRequests((index) => [
+			metadata("server"),
+			...completedEvents(`response-${index}`),
+		]);
+		await streamOpenAICodexResponses(model, context, { ...options, transport: "websocket" }).result();
+		await streamOpenAICodexResponses({ ...model, headers: { "X-Codex-Turn-State": "model" } }, context, {
+			...options,
+			transport: "websocket",
+			headers: { "X-CODEX-TURN-STATE": override },
+		}).result();
+		expect(handshakes[1]?.["x-codex-turn-state"]).toBe(override ?? undefined);
+		expect(frames[1].client_metadata?.["x-codex-turn-state"]).toBe(override ?? undefined);
+	});
+
+	it("does not infer a logical turn from cache identity", async () => {
+		const headers = captureSSE();
+		for (let i = 0; i < 2; i++)
+			await streamOpenAICodexResponses(model, context, {
+				...options,
+				requestIdentity: undefined,
+				sessionId: "cache",
+			}).result();
+		expect(headers.map((h) => h.get("x-codex-turn-state"))).toEqual([null, null]);
+	});
+
+	it("captures SSE metadata when no response header carries state", async () => {
+		const headers = captureSSE(() => sseResponse("", [metadata("event-state"), ...completedEvents()]));
+		for (let i = 0; i < 2; i++) {
+			expect((await streamOpenAICodexResponses(model, context, options).result()).stopReason).toBe("stop");
+		}
+		expect(headers.map((h) => h.get("x-codex-turn-state"))).toEqual([null, "event-state"]);
+	});
+
+	it("does not restore cleaned-up state when an in-flight request completes", async () => {
+		const headers = captureSSE(() => {
+			cleanupSessionResources(identity.sessionId);
+			return sseResponse("late-state");
+		});
+		for (let i = 0; i < 2; i++) await streamOpenAICodexResponses(model, context, options).result();
+		expect(headers.map((h) => h.get("x-codex-turn-state"))).toEqual([null, null]);
+	});
+
+	it("replays state on the internal WebSocket connection-limit retry, never its handshake", async () => {
+		const { frames, handshakes } = captureWebSocketRequests((index) =>
+			index === 1
+				? [
+						metadata("retry-state"),
+						{ type: "error", code: "websocket_connection_limit_reached", message: "reconnect" },
+					]
+				: completedEvents(),
+		);
+		expect(
+			(await streamOpenAICodexResponses(model, context, { ...options, transport: "auto" }).result()).stopReason,
+		).toBe("stop");
+		expect(frames.map((f) => f.client_metadata?.["x-codex-turn-state"])).toEqual([undefined, "retry-state"]);
+		expect(handshakes.map((h) => h?.["x-codex-turn-state"])).toEqual([undefined, undefined]);
+	});
+
+	it("ignores invalid event values without blocking later valid state", async () => {
+		const { frames } = captureWebSocketRequests((index) => [
+			metadata({ bad: true }),
+			metadata("invalid\r\nheader"),
+			metadata("valid"),
+			...completedEvents(`response-${index}`),
+		]);
+		for (let i = 0; i < 2; i++)
+			expect(
+				(await streamOpenAICodexResponses(model, context, { ...options, transport: "websocket" }).result())
+					.stopReason,
+			).toBe("stop");
+		expect(frames[1].client_metadata?.["x-codex-turn-state"]).toBe("valid");
+	});
+
+	it("does not let unrelated sessions evict a foreground turn", async () => {
+		const headers = captureSSE();
+		await streamOpenAICodexResponses(model, context, options).result();
+		for (let i = 0; i < 257; i++)
+			await streamOpenAICodexResponses(model, context, {
+				...options,
+				requestIdentity: { ...identity, sessionId: `session-${i}`, threadId: `thread-${i}`, turnId: `turn-${i}` },
+			}).result();
+		await streamOpenAICodexResponses(model, context, options).result();
+		expect(headers.at(-1)?.get("x-codex-turn-state")).toBe("first");
+	});
+
+	it.each(["account", "cleanup"])("does not restore a pending handshake after %s changes", async (change) => {
+		const opens: Array<() => void> = [];
+		const { frames, handshakes } = captureWebSocketRequests(undefined, (open) => opens.push(open));
+		const wsOptions = {
+			...options,
+			transport: "auto" as const,
+			cacheRetention: "short" as const,
+			sessionId: identity.sessionId,
+		};
+		const pending = streamOpenAICodexResponses(model, context, wsOptions).result();
+		await vi.waitFor(() => expect(opens).toHaveLength(1));
+		if (change === "cleanup") cleanupSessionResources(identity.sessionId);
+		const currentOptions = { ...wsOptions, apiKey: change === "account" ? token("account-2") : token() };
+		const current = streamOpenAICodexResponses(model, context, currentOptions).result();
+		await vi.waitFor(() => expect(opens).toHaveLength(2));
+		opens[1]();
+		expect((await current).stopReason).toBe("stop");
+		opens[0]();
+		expect((await pending).stopReason).toBe("error");
+		expect(globalThis.fetch).not.toHaveBeenCalled();
+		expect((await streamOpenAICodexResponses(model, context, currentOptions).result()).stopReason).toBe("stop");
+		expect(frames).toHaveLength(2);
+		expect(handshakes).toHaveLength(2);
+	});
+
+	it("invalidates a cached socket when an intervening SSE request changes account", async () => {
+		const { handshakes, frames } = captureWebSocketRequests();
+		const wsOptions = {
+			...options,
+			transport: "auto" as const,
+			cacheRetention: "short" as const,
+			sessionId: identity.sessionId,
+		};
+		await streamOpenAICodexResponses(model, context, wsOptions).result();
+		captureSSE();
+		await streamOpenAICodexResponses(model, context, {
+			...wsOptions,
+			transport: "sse",
+			apiKey: token("account-2"),
+		}).result();
+		await streamOpenAICodexResponses(model, context, wsOptions).result();
+		expect(handshakes).toHaveLength(2);
+		expect(frames.map((f) => f.previous_response_id)).toEqual([undefined, undefined]);
+	});
+
+	it("discards the previous foreground turn when a new one starts", async () => {
+		const headers = captureSSE();
+		for (const turnId of ["old", "new", "old"]) {
+			await streamOpenAICodexResponses(model, context, {
+				...options,
+				requestIdentity: { ...identity, turnId },
+			}).result();
+		}
+		expect(headers.map((h) => h.get("x-codex-turn-state"))).toEqual([null, null, null]);
+	});
+
+	it.each(["account", "endpoint"])(
+		"reconnects and drops continuation state on %s changes and return",
+		async (change) => {
+			const { frames, handshakes, urls } = captureWebSocketRequests((index) => [
+				metadata(`state-${index}`),
+				...completedEvents(`response-${index}`),
+			]);
+			const messages = [...context.messages];
+			for (let index = 0; index < 3; index++) {
+				const result = await streamOpenAICodexResponses(
+					index === 1 && change === "endpoint" ? { ...model, baseUrl: "https://other.test" } : model,
+					{ ...context, messages },
+					{
+						...options,
+						transport: "auto",
+						cacheRetention: "short",
+						sessionId: identity.sessionId,
+						apiKey: index === 1 && change === "account" ? token("account-2") : token(),
+					},
+				).result();
+				expect(result.stopReason).toBe("stop");
+				messages.push(result, { role: "user", content: "next", timestamp: 2 });
+			}
+			expect(handshakes).toHaveLength(3);
+			expect(frames.map((f) => f.previous_response_id)).toEqual([undefined, undefined, undefined]);
+			expect(frames.map((f) => f.client_metadata?.["x-codex-turn-state"])).toEqual([
+				undefined,
+				undefined,
+				undefined,
+			]);
+			if (change === "endpoint") expect(urls[1]).toBe("wss://other.test/codex/responses");
+			else expect(handshakes[1]?.["chatgpt-account-id"]).toBe("account-2");
+		},
+	);
 });
